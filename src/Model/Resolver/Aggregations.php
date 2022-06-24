@@ -15,13 +15,21 @@ namespace ScandiPWA\CatalogGraphQl\Model\Resolver;
 use Magento\CatalogGraphQl\Model\Resolver\Aggregations as AggregationsBase;
 use Magento\CatalogGraphQl\Model\Resolver\Layer\DataProvider\Filters;
 use Magento\CatalogGraphQl\DataProvider\Product\LayeredNavigation\LayerBuilder;
+use Magento\CatalogGraphQl\DataProvider\Product\LayeredNavigation\Builder\Aggregations\Category\IncludeDirectChildrenOnly;
+use Magento\Directory\Model\PriceCurrency;
+use Magento\Framework\App\ObjectManager;
 use Magento\Framework\GraphQl\Config\Element\Field;
+use Magento\Framework\GraphQl\Query\ResolverInterface;
 use Magento\Framework\GraphQl\Schema\Type\ResolveInfo;
 use Magento\Framework\Exception\LocalizedException;
 use Magento\Store\Api\Data\StoreInterface;
 use Magento\Catalog\Model\CategoryRepository;
 use Magento\Catalog\Model\ResourceModel\Eav\Attribute;
 
+/**
+ * Class Aggregations
+ * @package ScandiPWA\CatalogGraphQl\Model\Resolver
+ */
 class Aggregations extends AggregationsBase {
     /**
      * @var Attribute
@@ -32,6 +40,26 @@ class Aggregations extends AggregationsBase {
      * @var CategoryRepository
      */
     protected $categoryRepository;
+
+    /**
+     * @var Filters
+     */
+    protected Filters $filtersDataProvider;
+
+    /**
+     * @var LayerBuilder
+     */
+    protected LayerBuilder $layerBuilder;
+
+    /**
+     * @var PriceCurrency
+     */
+    protected PriceCurrency $priceCurrency;
+
+    /**
+     * @var IncludeDirectChildrenOnly
+     */
+    protected IncludeDirectChildrenOnly $includeDirectChildrenOnly;
 
     /**
      * Code of the price attribute in aggregations
@@ -55,7 +83,9 @@ class Aggregations extends AggregationsBase {
         Filters $filtersDataProvider,
         LayerBuilder $layerBuilder,
         Attribute $attribute,
-        CategoryRepository $categoryRepository
+        CategoryRepository $categoryRepository,
+        PriceCurrency $priceCurrency = null,
+        IncludeDirectChildrenOnly $includeDirectChildrenOnly = null
     )
     {
         parent::__construct(
@@ -65,6 +95,11 @@ class Aggregations extends AggregationsBase {
 
         $this->attribute = $attribute;
         $this->categoryRepository = $categoryRepository;
+        $this->filtersDataProvider = $filtersDataProvider;
+        $this->layerBuilder = $layerBuilder;
+        $this->priceCurrency = $priceCurrency ?: ObjectManager::getInstance()->get(PriceCurrency::class);
+        $this->includeDirectChildrenOnly = $includeDirectChildrenOnly
+            ?: ObjectManager::getInstance()->get(IncludeDirectChildrenOnly::class);
     }
 
     /**
@@ -77,19 +112,50 @@ class Aggregations extends AggregationsBase {
         array $value = null,
         array $args = null
     ) {
-        $result = parent::resolve($field, $context, $info, $value);
+        if (!isset($value['layer_type']) || !isset($value['search_result'])) {
+            return null;
+        }
+
+        $aggregations = $value['search_result']->getSearchAggregation();
+
+        if ($aggregations) {
+            $categoryFilter = $value['categories'] ?? [];
+            $includeDirectChildrenOnly = $args['filter']['category']['includeDirectChildrenOnly'] ?? false;
+
+            if ($includeDirectChildrenOnly && !empty($categoryFilter)) {
+                $this->includeDirectChildrenOnly->setFilter(['category' => $categoryFilter]);
+            }
+
+            /** @var StoreInterface $store */
+            $store = $context->getExtensionAttributes()->getStore();
+            $storeId = (int)$store->getId();
+            $results = $this->layerBuilder->build($aggregations, $storeId);
+
+            if (isset($results['price_bucket'])) {
+                foreach ($results['price_bucket']['options'] as &$value) {
+                    list($from, $to) = explode('_', $value['value']);
+
+                    $newLabel = $this->priceCurrency->convertAndRound($from)
+                        . '~'
+                        . $this->priceCurrency->convertAndRound($to);
+                    $value['label'] = $newLabel;
+                }
+            }
+        } else {
+            $results = [];
+        }
 
         $isSearch = isset($value['layer_type']) && $value['layer_type'] == 'search';
 
-        $result = $this->processPriceFilter($result);
-        $result = $this->enhanceAttributes($result, $isSearch);
+        $results = $this->processPriceFilter($results);
+        $results = $this->enhanceAttributes($results, $isSearch);
 
         // on the search results page we should show only top level categories
         if($isSearch){
-            $result = $this->removeNonTopLevelCategories($result);
+            $results = $this->removeNonTopLevelCategories($results);
         }
 
-        return $result;
+        return $results;
     }
 
     /**
